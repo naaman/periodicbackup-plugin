@@ -46,6 +46,11 @@
             <artifactId>guava</artifactId>
             <version>r05</version>
         </dependency>
+        <dependency>
+            <groupId>net.java.dev.jets3t</groupId>
+            <artifactId>jets3t</artifactId>
+            <version>0.8.1</version>
+        </dependency>
     </dependencies>
 
     <distributionManagement>

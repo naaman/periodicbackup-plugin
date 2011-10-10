@@ -1,12 +1,12 @@
 package org.jenkinsci.plugins.periodicbackup;
 
 import com.google.common.base.Charsets;
-import com.google.common.collect.Iterables;
+import com.google.common.base.Objects;
 import com.google.common.collect.Sets;
-import com.google.common.io.Files;
 import hudson.Extension;
 import hudson.model.Hudson;
 import hudson.util.FormValidation;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.jets3t.service.S3Service;
 import org.jets3t.service.S3ServiceException;
@@ -18,15 +18,7 @@ import org.jets3t.service.security.AWSCredentials;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 
-import javax.xml.stream.events.Characters;
-import java.io.File;
-import java.io.IOException;
-import java.io.StringReader;
-import java.io.StringWriter;
-import java.nio.charset.Charset;
-import java.security.NoSuchAlgorithmException;
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
+import java.io.*;
 import java.util.*;
 import java.util.logging.Logger;
 
@@ -41,9 +33,12 @@ public class S3Location extends Location {
     private final String accessKey;
     private final String accessSecret;
     private final Logger logger = Logger.getLogger(S3Location.class.getName());
+    // S3 Metadata tag that specifies the timestamp of the backup object
     private static final String S3META_BACKUPTIMESTAMP = "backuptimestamp";
-    private static final String S3META_JENKINSBACKUP = "jenkinsbackup";
-    private static final String S3META_ISBACKUPOBJECT = "isbackupobject";
+    // S3 Metadata flag where true means it is an archive that should be used as an archive
+    private static final String S3META_ISJENKINSBACKUPARCHIVE = "jenkinsbackuparchive";
+    // S3 Metadata flag where true means the file represents a BackupObject xml file
+    private static final String S3META_ISJENKINSBACKUPOBJECT = "jenkinsbackupobject";
 
     @DataBoundConstructor
     public S3Location(String bucket, String accessSecret, String accessKey, boolean enabled) {
@@ -66,8 +61,8 @@ public class S3Location extends Location {
                 // make a second call to get the object because listObjects doesn't include
                 // custom metadata. it doesn't appear there's a nice way to do this in bulk.
                 S3Object objectWithMetadata = s3Service.getObject(bucket, s.getKey());
-                if (objectWithMetadata.containsMetadata(S3META_ISBACKUPOBJECT)
-                        && objectWithMetadata.getMetadata(S3META_ISBACKUPOBJECT).toString().equalsIgnoreCase("true")) {
+                if (objectWithMetadata.containsMetadata(S3META_ISJENKINSBACKUPOBJECT)
+                        && objectWithMetadata.getMetadata(S3META_ISJENKINSBACKUPOBJECT).toString().equalsIgnoreCase("true")) {
                     StringWriter backupObjectAsXml = new StringWriter();
                     IOUtils.copy(objectWithMetadata.getDataInputStream(), backupObjectAsXml, Charsets.UTF_8.name());
                     backups.add((BackupObject) Hudson.XSTREAM.fromXML(backupObjectAsXml.toString()));
@@ -91,23 +86,40 @@ public class S3Location extends Location {
     @Override
     public void storeBackupInLocation(Iterable<File> archives, File backupObjectFile) throws IOException {
         AWSCredentials auth = new AWSCredentials(accessKey, accessSecret);
-        String backupTimestamp = DateFormat.getInstance().format(System.currentTimeMillis());
+
+        // convert the file into an actual BackupObject and get the timestamp it intends to use.
+        Date backupObjectTimestamp = ((BackupObject) Hudson.XSTREAM.fromXML(new FileInputStream(backupObjectFile))).getTimestamp();
+        String backupTimestamp = Util.getFormattedDate(BackupObject.FILE_TIMESTAMP_PATTERN, backupObjectTimestamp);
+        logger.info("Creating S3 backup using " + backupTimestamp);
+        
         S3Service s3Service;
         try {
             s3Service = new RestS3Service(auth);
             S3Bucket s3Bucket = s3Service.getBucket(bucket);
+
+            logger.info("Creating S3 " + backupTimestamp + ".pbobj");
+
+            // mark the BackupObject as a jenkinsbackupobject=true and jenkinsbackuparchive=false
+            // so that the file can be identified as a BackupObject later.
             S3Object backupObject = new S3Object(backupObjectFile);
             backupObject.addMetadata(S3META_BACKUPTIMESTAMP, backupTimestamp);
-            backupObject.addMetadata(S3META_JENKINSBACKUP, "true");
-            backupObject.addMetadata(S3META_ISBACKUPOBJECT, "true");
+            backupObject.addMetadata(S3META_ISJENKINSBACKUPARCHIVE, "false");
+            backupObject.addMetadata(S3META_ISJENKINSBACKUPOBJECT, "true");
             s3Service.putObject(s3Bucket, backupObject);
+
+            logger.info("Creating archive files in S3/" + bucket + "...");
+
             for (File file : archives) {
+                // mark the archive file as jenkinsbackuparchive=true and jenkinsbackupobject=false
+                // so that the file can be identified as an archive later.
                 S3Object obj = new S3Object(file);
                 obj.addMetadata(S3META_BACKUPTIMESTAMP, backupTimestamp);
-                obj.addMetadata(S3META_JENKINSBACKUP, "true");
-                obj.addMetadata(S3META_ISBACKUPOBJECT, "false");
+                obj.addMetadata(S3META_ISJENKINSBACKUPARCHIVE, "true");
+                obj.addMetadata(S3META_ISJENKINSBACKUPOBJECT, "false");
                 s3Service.putObject(s3Bucket, obj);
             }
+
+            logger.info("Archive files created in S3/" + bucket);
         } catch (Exception e) {
             logger.severe("An unhandled exception occurred while connecting to Amazon S3. " + e.getMessage());
             return;
@@ -116,9 +128,45 @@ public class S3Location extends Location {
 
     @Override
     public Iterable<File> retrieveBackupFromLocation(BackupObject backup, File tempDir) throws IOException, PeriodicBackupException {
-        backup.getDisplayName();
-        // TODO: implement this method
-        return null;  //To change body of implemented methods use File | Settings | File Templates.
+        AWSCredentials auth = new AWSCredentials(accessKey, accessSecret);
+        S3Service s3Service;
+        try {
+            logger.info("Logging into aws");
+            s3Service = new RestS3Service(auth);
+
+            S3Object[] s3Objects = s3Service.listObjects(bucket);
+            List<File> backupsToRestore = new ArrayList<File>();
+
+            for (S3Object s : s3Objects) {
+                // make a second call to get the object because listObjects doesn't include
+                // custom metadata. it doesn't appear there's a nice way to do this in bulk.
+                S3Object objectWithMetadata = s3Service.getObject(bucket, s.getKey());
+                logger.info(objectWithMetadata.toString());
+
+                // if the object is a backup and the timestamp is equal, then add it to the list of backups to restore
+                if (objectWithMetadata.containsMetadata(S3META_ISJENKINSBACKUPARCHIVE)
+                    && objectWithMetadata.getMetadata(S3META_ISJENKINSBACKUPARCHIVE).equals("true")
+                    && objectWithMetadata.containsMetadata(S3META_BACKUPTIMESTAMP)
+                    && objectWithMetadata.getMetadata(S3META_BACKUPTIMESTAMP).toString().equals(
+                        Util.getFormattedDate(BackupObject.FILE_TIMESTAMP_PATTERN, backup.getTimestamp()))) {
+                    logger.info("Found backup: " + objectWithMetadata.toString());
+
+                    String backupFileName = objectWithMetadata.getMetadata(S3META_BACKUPTIMESTAMP).toString()
+                            + "." + backup.getStorage().getDescriptor().getArchiveFileExtension();
+                    File backupFile = new File(tempDir, backupFileName);
+
+                    FileUtils.writeByteArrayToFile(backupFile,
+                            IOUtils.toByteArray(objectWithMetadata.getDataInputStream()));
+                    backupsToRestore.add(backupFile);
+                }
+            }
+            Collections.sort(backupsToRestore);
+            return backupsToRestore;
+        } catch (S3ServiceException e) {
+            throw new PeriodicBackupException("An unhandled exception occurred while connecting to Amazon S3. " + e.getMessage());
+        } catch (ServiceException e) {
+            throw new PeriodicBackupException("An unhandled exception occurred while connecting to Amazon S3. " + e.getMessage());
+        }
     }
 
     @Override
@@ -140,6 +188,22 @@ public class S3Location extends Location {
 
     public String getAccessSecret() {
         return accessSecret;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(bucket, accessKey, accessSecret);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o instanceof S3Location) {
+            S3Location that = (S3Location)o;
+            return Objects.equal(this.bucket, that.bucket)
+                && Objects.equal(this.accessKey, that.accessKey)
+                && Objects.equal(this.accessSecret, that.accessSecret);
+        }
+        return false;
     }
 
     @Extension

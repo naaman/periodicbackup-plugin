@@ -28,6 +28,7 @@ import hudson.DescriptorExtensionList;
 import hudson.model.AbstractModelObject;
 import hudson.model.Describable;
 import hudson.model.Hudson;
+import org.jets3t.service.S3ServiceException;
 
 import java.io.File;
 import java.io.IOException;

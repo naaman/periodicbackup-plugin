@@ -39,7 +39,7 @@
         <f:textbox/>
     </f:entry>
     <f:entry title="${%accessSecret.title}" field="accessSecret">
-        <f:textbox/>
+        <f:password/>
     </f:entry>
     <f:validateButton
             title="${%validateButton.title}" progress="${%validateButton.progress}"

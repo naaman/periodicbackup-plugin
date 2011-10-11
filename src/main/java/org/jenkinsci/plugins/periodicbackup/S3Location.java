@@ -155,6 +155,8 @@ public class S3Location extends Location {
                             + "." + backup.getStorage().getDescriptor().getArchiveFileExtension();
                     File backupFile = new File(tempDir, backupFileName);
 
+                    // synchronously pull down the file and write it to the provided temp directory
+                    // TODO: create an async option to download the restore in the background
                     FileUtils.writeByteArrayToFile(backupFile,
                             IOUtils.toByteArray(objectWithMetadata.getDataInputStream()));
                     backupsToRestore.add(backupFile);
@@ -171,7 +173,24 @@ public class S3Location extends Location {
 
     @Override
     public void deleteBackupFiles(BackupObject backupObject) {
-        
+        AWSCredentials auth = new AWSCredentials(accessKey, accessSecret);
+        S3Service s3Service;
+        try {
+            logger.info("Logging into aws");
+            s3Service = new RestS3Service(auth);
+
+            S3Object[] s3Objects = s3Service.listObjects(bucket);
+
+            for (S3Object s : s3Objects) {
+                if (s.getName().startsWith(Util.generateFileNameBase(backupObject.getTimestamp()))) {
+                    s3Service.deleteObject(bucket, s.getKey());
+                }
+            }
+        } catch (S3ServiceException e) {
+            logger.severe("An unhandled exception occurred while connecting to Amazon S3. " + e.getMessage());
+        } catch (ServiceException e) {
+            logger.severe("An unhandled exception occurred while connecting to Amazon S3. " + e.getMessage());
+        }
     }
 
     public String getDisplayName() {
